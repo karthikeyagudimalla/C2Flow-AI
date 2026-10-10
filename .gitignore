@@ -1,0 +1,25 @@
+
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local databases
+*.db
+*.sqlite3
+
+# Test and tooling cache
+.pytest_cache/
+.coverage
+
+# Generated files and uploads
+uploads/
+generated/
