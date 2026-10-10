@@ -533,7 +533,7 @@ if (!signedIn) {
                     status: task.status ?? "To Do",
                     priority: task.priority ?? "Medium",
                   }))
-                );
+                  );
 
               } catch (error) {
                 setAuthError(error.message || "Authentication failed. Please try again.");
