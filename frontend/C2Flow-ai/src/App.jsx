@@ -38,45 +38,29 @@ import "./index.css";
 
 
 
-const starterTasks = [
+const taskStatusFromApi = {
+  pending: "To Do",
+  in_progress: "In Progress",
+  completed: "Done",
+  cancelled: "Cancelled",
+};
 
-  {
+const taskStatusToApi = {
+  "To Do": "pending",
+  "In Progress": "in_progress",
+  Done: "completed",
+  Cancelled: "cancelled",
+};
 
-    id: 1,
-
-    title: "Build the dashboard interface",
-
-    status: "In Progress",
-
-    priority: "High",
-
-  },
-
-  {
-
-    id: 2,
-
-    title: "Prepare the hackathon presentation",
-
-    status: "To Do",
-
-    priority: "High",
-
-  },
-
-  {
-
-    id: 3,
-
-    title: "Test website responsiveness",
-
-    status: "To Do",
-
-    priority: "Medium",
-
-  },
-
-];
+function taskFromApi(task) {
+  return {
+    ...task,
+    status: taskStatusFromApi[task.status] || "To Do",
+    priority: task.priority
+      ? task.priority[0].toUpperCase() + task.priority.slice(1)
+      : "Medium",
+  };
+}
 
 
 
@@ -120,7 +104,8 @@ export default function App() {
 
   const [dark, setDark] = useState(true);
 
-  const [tasks, setTasks] = useState(starterTasks);
+  const [tasks, setTasks] = useState([]);
+  const [taskError, setTaskError] = useState("");
 
   const [newTitle, setNewTitle] = useState("");
 
@@ -142,90 +127,80 @@ export default function App() {
 
 
 
-  function addTask(event) {
-
+  async function addTask(event) {
     event.preventDefault();
+    const title = newTitle.trim();
+    if (!title) return;
 
+    setTaskError("");
+    try {
+      const created = await apiRequest("/api/tasks", {
+        token,
+        method: "POST",
+        body: JSON.stringify({ title, priority: "medium" }),
+      });
+      setTasks((old) => [taskFromApi(created), ...old]);
+      setNewTitle("");
+    } catch (error) {
+      setTaskError(error.message || "Could not save this task.");
+    }
+  }
 
+  async function updateTask(taskId, changes) {
+    setTaskError("");
+    try {
+      const updated = await apiRequest(`/api/tasks/${taskId}`, {
+        token,
+        method: "PATCH",
+        body: JSON.stringify({
+          ...changes,
+          ...(changes.status ? { status: taskStatusToApi[changes.status] } : {}),
+        }),
+      });
+      setTasks((old) => old.map((task) =>
+        task.id === taskId ? taskFromApi(updated) : task
+      ));
+    } catch (error) {
+      setTaskError(error.message || "Could not update this task.");
+    }
+  }
 
-    if (!newTitle.trim()) return;
-
-
-
-    setTasks((old) => [
-
-      ...old,
-
-      {
-
-        id: Date.now(),
-
-        title: newTitle.trim(),
-
-        status: "To Do",
-
-        priority: "Medium",
-
-      },
-
-    ]);
-
-
-
-    setNewTitle("");
-
+  async function deleteTask(taskId) {
+    setTaskError("");
+    try {
+      await apiRequest(`/api/tasks/${taskId}`, { token, method: "DELETE" });
+      setTasks((old) => old.filter((task) => task.id !== taskId));
+    } catch (error) {
+      setTaskError(error.message || "Could not delete this task.");
+    }
   }
 
 
 
-  function makeWorkflow(event) {
-
+  async function makeWorkflow(event) {
     event.preventDefault();
-
-
-
     if (!prompt.trim()) return;
 
-
-
     const goal = prompt.trim();
-
-
-
-    setTasks((old) => [
-
-      {
-
-        id: Date.now(),
-
-        title: `Plan: ${goal}`,
-
-        status: "To Do",
-
-        priority: "High",
-
-      },
-
-      {
-
-        id: Date.now() + 1,
-
-        title: `Execute and review: ${goal}`,
-
-        status: "To Do",
-
-        priority: "Medium",
-
-      },
-
-      ...old,
-
-    ]);
-
-
-
-    setGenerated(true);
-
+    setTaskError("");
+    try {
+      const createdTasks = await Promise.all([
+        apiRequest("/api/tasks", {
+          token,
+          method: "POST",
+          body: JSON.stringify({ title: `Plan: ${goal}`, priority: "high" }),
+        }),
+        apiRequest("/api/tasks", {
+          token,
+          method: "POST",
+          body: JSON.stringify({ title: `Execute and review: ${goal}`, priority: "medium" }),
+        }),
+      ]);
+      setTasks((old) => [...createdTasks.map(taskFromApi), ...old]);
+      setGenerated(true);
+    } catch (error) {
+      setTaskError(error.message || "Could not save the generated tasks.");
+    }
   }
 
 
@@ -276,13 +251,11 @@ if (legalPage === "privacy") {
 
           <p>
 
-            C2Flow AI is a hackathon demonstration.
+            C2Flow AI is a demonstration application. Your
 
-            The current version uses your entered email for
+            account email and workspace tasks are stored by
 
-            the interface and keeps task information in
-
-            application state while the app is running.
+            the connected backend for your account.
 
           </p>
 
@@ -296,11 +269,11 @@ if (legalPage === "privacy") {
 
           <p>
 
-            Information entered into the demo is used to
+            Account information is used to authenticate you.
 
-            display your workspace, manage tasks, and
+            Tasks you create are used to display and manage
 
-            demonstrate workflow features.
+            your workspace across sessions.
 
           </p>
 
@@ -314,13 +287,11 @@ if (legalPage === "privacy") {
 
           <p>
 
-            This demo does not currently have a connected
+            Account passwords are stored as password hashes.
 
-            backend database or real account authentication.
+            Workspace records are associated with your account
 
-            Task state may be lost when the application
-
-            reloads. Do not enter confidential information.
+            in the configured backend database.
 
           </p>
 
@@ -519,21 +490,15 @@ if (!signedIn) {
                 
                 const result = await loginUser(email, password);
                 setToken(result.access_token);
-                setSignedIn(true);
-                setPage("Dashboard");
-                setPassword("");
 
                 const backendTasks = await apiRequest("/api/tasks", {
                   token: result.access_token,
                 });
 
-                setTasks(
-                  backendTasks.map((task) => ({
-                    ...task,
-                    status: task.status ?? "To Do",
-                    priority: task.priority ?? "Medium",
-                  }))
-                  );
+                setTasks(backendTasks.map(taskFromApi));
+                setSignedIn(true);
+                setPage("Dashboard");
+                setPassword("");
 
               } catch (error) {
                 setAuthError(error.message || "Authentication failed. Please try again.");
@@ -612,7 +577,7 @@ if (!signedIn) {
 
                   }
 
-                  minLength={4}
+                  minLength={12}
 
                   required
 
@@ -1109,6 +1074,8 @@ if (!signedIn) {
 
 
 
+          {taskError && <p className="auth-error" role="alert">{taskError}</p>}
+
           {page === "Dashboard" && (
 
             <>
@@ -1279,7 +1246,8 @@ if (!signedIn) {
 
                   tasks={tasks.slice(0, 5)}
 
-                  setTasks={setTasks}
+                  updateTask={updateTask}
+                  deleteTask={deleteTask}
 
                 />
 
@@ -1341,7 +1309,7 @@ if (!signedIn) {
 
 
 
-              <TaskList tasks={tasks} setTasks={setTasks} />
+              <TaskList tasks={tasks} updateTask={updateTask} deleteTask={deleteTask} />
 
             </section>
 
@@ -1419,11 +1387,9 @@ if (!signedIn) {
 
                 </form>
 
-
-
                 <p className="hint">
 
-                  Demo version: creates a basic plan locally.
+                  Demo version: creates a basic task plan.
 
                   A real AI service is not connected yet.
 
@@ -1558,27 +1524,7 @@ if (!signedIn) {
                           value={task.status}
 
                           onChange={(event) =>
-
-                            setTasks((old) =>
-
-                              old.map((item) =>
-
-                                item.id === task.id
-
-                                  ? {
-
-                                      ...item,
-
-                                      status: event.target.value,
-
-                                    }
-
-                                  : item
-
-                              )
-
-                            )
-
+                            updateTask(task.id, { status: event.target.value })
                           }
 
                         >
@@ -1769,7 +1715,7 @@ function Stat({ icon, label, value, color }) {
 
 
 
-function TaskList({ tasks, setTasks }) {
+function TaskList({ tasks, updateTask, deleteTask }) {
 
   if (!tasks.length) {
 
@@ -1809,31 +1755,9 @@ function TaskList({ tasks, setTasks }) {
 
             aria-label={`Toggle completion for ${task.title}`}
 
-            onClick={() =>
-
-              setTasks((old) =>
-
-                old.map((item) =>
-
-                  item.id === task.id
-
-                    ? {
-
-                        ...item,
-
-                        status:
-
-                          item.status === "Done" ? "To Do" : "Done",
-
-                      }
-
-                    : item
-
-                )
-
-              )
-
-            }
+            onClick={() => updateTask(task.id, {
+              status: task.status === "Done" ? "To Do" : "Done",
+            })}
 
           >
 
@@ -1895,15 +1819,7 @@ function TaskList({ tasks, setTasks }) {
 
             aria-label={`Delete ${task.title}`}
 
-            onClick={() =>
-
-              setTasks((old) =>
-
-                old.filter((item) => item.id !== task.id)
-
-              )
-
-            }
+            onClick={() => deleteTask(task.id)}
 
           >
 

@@ -1,5 +1,5 @@
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.config import settings
@@ -25,6 +25,19 @@ engine = create_engine(
     pool_pre_ping=True,
     connect_args={"sslmode": "require"},
 )
+
+
+def ensure_task_priority_column():
+    """Add the task priority field to databases created by earlier versions."""
+    columns = {column["name"] for column in inspect(engine).get_columns("tasks")}
+    if "priority" not in columns:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "ALTER TABLE tasks ADD COLUMN priority "
+                    "VARCHAR(20) NOT NULL DEFAULT 'medium'"
+                )
+            )
 
 SessionLocal = sessionmaker(
     bind=engine,

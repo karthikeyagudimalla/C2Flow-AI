@@ -6,7 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.database import Base, engine
+from app.database import Base, engine, ensure_task_priority_column
 from app.dependencies import get_db
 from app.models import User
 from app.schemas import (
@@ -47,6 +47,7 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    ensure_task_priority_column()
     yield
 
 
@@ -218,6 +219,7 @@ def create_task(
         owner_id=user_id,
         title=payload.title.strip(),
         description=payload.description,
+        priority=payload.priority,
     )
 
     if not task.title:

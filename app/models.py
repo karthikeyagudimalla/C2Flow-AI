@@ -71,6 +71,12 @@ class Task(Base):
         nullable=False,
     )
 
+    priority: Mapped[str] = mapped_column(
+        String(20),
+        default="medium",
+        nullable=False,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         default=utc_now,

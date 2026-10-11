@@ -24,6 +24,7 @@ class LoginResponse(BaseModel):
 class TaskCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     description: str | None = Field(default=None, max_length=5000)
+    priority: str = Field(default="medium", pattern="^(low|medium|high)$")
 
 
 class TaskUpdate(BaseModel):
@@ -33,6 +34,7 @@ class TaskUpdate(BaseModel):
         default=None,
         pattern="^(pending|in_progress|completed|cancelled)$",
     )
+    priority: str | None = Field(default=None, pattern="^(low|medium|high)$")
 
 
 class TaskResponse(BaseModel):
@@ -41,6 +43,7 @@ class TaskResponse(BaseModel):
     title: str
     description: str | None
     status: str
+    priority: str
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
