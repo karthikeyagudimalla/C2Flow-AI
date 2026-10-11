@@ -2,7 +2,7 @@
 import { registerUser, loginUser, apiRequest } from "./api";
 
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import {
 
@@ -25,6 +25,12 @@ import {
   CheckCircle2,
 
   Clock,
+
+  Bell,
+
+  CalendarClock,
+
+  ShieldCheck,
 
   ArrowUpRight,
 
@@ -72,7 +78,13 @@ const navigation = [
 
   { name: "AI Flow", icon: Sparkles },
 
+  { name: "Task Board", icon: Workflow },
+
   { name: "Workflows", icon: Workflow },
+
+  { name: "Reminders", icon: Bell },
+
+  { name: "Approvals", icon: ShieldCheck },
 
   { name: "Settings", icon: Settings },
 
@@ -102,16 +114,79 @@ export default function App() {
 
   const [page, setPage] = useState("Dashboard");
 
-  const [dark, setDark] = useState(true);
+  const [dark, setDark] = useState(() =>
+    window.localStorage.getItem("c2flow_theme") !== "light"
+  );
 
   const [tasks, setTasks] = useState([]);
   const [taskError, setTaskError] = useState("");
 
+  const [reminders, setReminders] = useState([]);
+
+  const [workflows, setWorkflows] = useState([]);
+
+  const [approvals, setApprovals] = useState([]);
+
+  const [resourceError, setResourceError] = useState("");
+
+  const [reminderTitle, setReminderTitle] = useState("");
+
+  const [reminderAt, setReminderAt] = useState("");
+
+  const [reminderDrafts, setReminderDrafts] = useState({});
+
+  const [workflowName, setWorkflowName] = useState("");
+
+  const [workflowDescription, setWorkflowDescription] = useState("");
+
+  const [assistantReply, setAssistantReply] = useState(null);
+
+  const [approvalPreview, setApprovalPreview] = useState(null);
+
   const [newTitle, setNewTitle] = useState("");
+
+  const [newDescription, setNewDescription] = useState("");
 
   const [prompt, setPrompt] = useState("");
 
-  const [generated, setGenerated] = useState(false);
+
+  async function loadWorkspace(accessToken) {
+    const [user, backendTasks, backendReminders, backendWorkflows, backendApprovals] =
+      await Promise.all([
+        apiRequest("/api/auth/me", { token: accessToken }),
+        apiRequest("/api/tasks", { token: accessToken }),
+        apiRequest("/api/reminders", { token: accessToken }),
+        apiRequest("/api/workflows", { token: accessToken }),
+        apiRequest("/api/approvals", { token: accessToken }),
+      ]);
+
+    setEmail(user.email);
+    setTasks(backendTasks.map(taskFromApi));
+    setReminders(backendReminders);
+    setWorkflows(backendWorkflows);
+    setApprovals(backendApprovals);
+  }
+
+  useEffect(() => {
+    const savedToken = window.localStorage.getItem("c2flow_access_token");
+    if (!savedToken) return;
+
+    // Session restoration must hydrate the workspace after the initial render.
+    // oxlint-disable-next-line react/set-state-in-effect
+    loadWorkspace(savedToken)
+      .then(() => {
+        setToken(savedToken);
+        setSignedIn(true);
+      })
+      .catch(() => {
+        window.localStorage.removeItem("c2flow_access_token");
+        setToken("");
+      });
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem("c2flow_theme", dark ? "dark" : "light");
+  }, [dark]);
 
 
 
@@ -123,7 +198,9 @@ export default function App() {
 
 
 
-  const pending = tasks.length - completed;
+  const pending = tasks.filter(
+    (task) => task.status !== "Done" && task.status !== "Cancelled"
+  ).length;
 
 
 
@@ -137,10 +214,15 @@ export default function App() {
       const created = await apiRequest("/api/tasks", {
         token,
         method: "POST",
-        body: JSON.stringify({ title, priority: "medium" }),
+        body: JSON.stringify({
+          title,
+          description: newDescription.trim() || null,
+          priority: "medium",
+        }),
       });
       setTasks((old) => [taskFromApi(created), ...old]);
       setNewTitle("");
+      setNewDescription("");
     } catch (error) {
       setTaskError(error.message || "Could not save this task.");
     }
@@ -155,6 +237,7 @@ export default function App() {
         body: JSON.stringify({
           ...changes,
           ...(changes.status ? { status: taskStatusToApi[changes.status] } : {}),
+          ...(changes.priority ? { priority: changes.priority.toLowerCase() } : {}),
         }),
       });
       setTasks((old) => old.map((task) =>
@@ -177,30 +260,185 @@ export default function App() {
 
 
 
-  async function makeWorkflow(event) {
+  async function sendAssistantMessage(event) {
     event.preventDefault();
     if (!prompt.trim()) return;
 
     const goal = prompt.trim();
-    setTaskError("");
+    setResourceError("");
     try {
-      const createdTasks = await Promise.all([
-        apiRequest("/api/tasks", {
-          token,
-          method: "POST",
-          body: JSON.stringify({ title: `Plan: ${goal}`, priority: "high" }),
-        }),
-        apiRequest("/api/tasks", {
-          token,
-          method: "POST",
-          body: JSON.stringify({ title: `Execute and review: ${goal}`, priority: "medium" }),
-        }),
-      ]);
-      setTasks((old) => [...createdTasks.map(taskFromApi), ...old]);
-      setGenerated(true);
+      const reply = await apiRequest("/api/assistant", {
+        token,
+        method: "POST",
+        body: JSON.stringify({ message: goal }),
+      });
+      setAssistantReply(reply);
+
+      if (["list_tasks", "list_pending_tasks"].includes(reply.intent)) {
+        setTasks(reply.data.map(taskFromApi));
+      } else if (reply.intent === "list_reminders") {
+        setReminders(reply.data);
+      } else if (reply.intent === "list_workflows") {
+        setWorkflows(reply.data);
+      } else if (reply.intent === "create_task" && reply.data?.id) {
+        setTasks((old) => [taskFromApi(reply.data), ...old]);
+      } else if (reply.intent === "create_reminder" && reply.data?.id) {
+        setReminders((old) => [...old, reply.data]);
+      } else if (reply.intent === "complete_task" && reply.data?.id) {
+        setTasks((old) => old.map((task) =>
+          task.id === reply.data.id ? taskFromApi({ ...task, ...reply.data }) : task
+        ));
+      } else if (reply.requires_approval) {
+        const currentApprovals = await apiRequest("/api/approvals", { token });
+        setApprovals(currentApprovals);
+      }
     } catch (error) {
-      setTaskError(error.message || "Could not save the generated tasks.");
+      setResourceError(error.message || "The assistant request failed.");
     }
+  }
+
+  async function createReminder(event) {
+    event.preventDefault();
+    setResourceError("");
+    try {
+      const created = await apiRequest("/api/reminders", {
+        token,
+        method: "POST",
+        body: JSON.stringify({
+          title: reminderTitle.trim(),
+          remind_at: new Date(reminderAt).toISOString(),
+        }),
+      });
+      setReminders((old) => [...old, created].sort(
+        (a, b) => new Date(a.remind_at) - new Date(b.remind_at)
+      ));
+      setReminderTitle("");
+      setReminderAt("");
+    } catch (error) {
+      setResourceError(error.message || "Could not save this reminder.");
+    }
+  }
+
+  async function updateReminder(reminderId, changes) {
+    setResourceError("");
+    try {
+      const updated = await apiRequest(`/api/reminders/${reminderId}`, {
+        token,
+        method: "PATCH",
+        body: JSON.stringify(changes),
+      });
+      setReminders((old) => old.map((item) =>
+        item.id === reminderId ? updated : item
+      ));
+    } catch (error) {
+      setResourceError(error.message || "Could not update this reminder.");
+    }
+  }
+
+  async function deleteReminder(reminderId) {
+    setResourceError("");
+    try {
+      await apiRequest(`/api/reminders/${reminderId}`, {
+        token,
+        method: "DELETE",
+      });
+      setReminders((old) => old.filter((item) => item.id !== reminderId));
+    } catch (error) {
+      setResourceError(error.message || "Could not delete this reminder.");
+    }
+  }
+
+  async function createWorkflow(event) {
+    event.preventDefault();
+    setResourceError("");
+    try {
+      const created = await apiRequest("/api/workflows", {
+        token,
+        method: "POST",
+        body: JSON.stringify({
+          name: workflowName.trim(),
+          description: workflowDescription.trim() || null,
+        }),
+      });
+      setWorkflows((old) => [created, ...old]);
+      setWorkflowName("");
+      setWorkflowDescription("");
+    } catch (error) {
+      setResourceError(error.message || "Could not save this workflow.");
+    }
+  }
+
+  async function updateWorkflow(workflowId, changes) {
+    setResourceError("");
+    try {
+      const updated = await apiRequest(`/api/workflows/${workflowId}`, {
+        token,
+        method: "PATCH",
+        body: JSON.stringify(changes),
+      });
+      setWorkflows((old) => old.map((item) =>
+        item.id === workflowId ? updated : item
+      ));
+    } catch (error) {
+      setResourceError(error.message || "Could not update this workflow.");
+    }
+  }
+
+  async function deleteWorkflow(workflowId) {
+    setResourceError("");
+    try {
+      await apiRequest(`/api/workflows/${workflowId}`, {
+        token,
+        method: "DELETE",
+      });
+      setWorkflows((old) => old.filter((item) => item.id !== workflowId));
+    } catch (error) {
+      setResourceError(error.message || "Could not delete this workflow.");
+    }
+  }
+
+  async function loadApprovalPreview(approvalId) {
+    setResourceError("");
+    try {
+      const preview = await apiRequest(
+        `/api/approvals/${approvalId}/preview`,
+        { token },
+      );
+      setApprovalPreview(preview);
+    } catch (error) {
+      setResourceError(error.message || "Could not load approval details.");
+    }
+  }
+
+  async function decideApproval(approvalId, decision) {
+    setResourceError("");
+    try {
+      const updated = await apiRequest(`/api/approvals/${approvalId}`, {
+        token,
+        method: "PATCH",
+        body: JSON.stringify({ decision }),
+      });
+      setApprovals((old) => old.map((item) =>
+        item.id === approvalId ? updated : item
+      ));
+      if (approvalPreview?.id === approvalId) {
+        setApprovalPreview((old) => ({ ...old, status: decision }));
+      }
+    } catch (error) {
+      setResourceError(error.message || "Could not update this approval.");
+    }
+  }
+
+  function signOut() {
+    window.localStorage.removeItem("c2flow_access_token");
+    setToken("");
+    setSignedIn(false);
+    setTasks([]);
+    setReminders([]);
+    setWorkflows([]);
+    setApprovals([]);
+    setPassword("");
+    setPage("Dashboard");
   }
 
 
@@ -490,17 +728,18 @@ if (!signedIn) {
                 
                 const result = await loginUser(email, password);
                 setToken(result.access_token);
-
-                const backendTasks = await apiRequest("/api/tasks", {
-                  token: result.access_token,
-                });
-
-                setTasks(backendTasks.map(taskFromApi));
+                window.localStorage.setItem(
+                  "c2flow_access_token",
+                  result.access_token,
+                );
+                await loadWorkspace(result.access_token);
                 setSignedIn(true);
                 setPage("Dashboard");
                 setPassword("");
 
               } catch (error) {
+                window.localStorage.removeItem("c2flow_access_token");
+                setToken("");
                 setAuthError(error.message || "Authentication failed. Please try again.");
               } finally {
                 setAuthLoading(false);
@@ -943,16 +1182,7 @@ if (!signedIn) {
               title="Sign out"
 
               aria-label="Sign out"
-
-              onClick={() => {
-
-                setSignedIn(false);
-
-                setPassword("");
-
-                setPage("Dashboard");
-
-              }}
+              onClick={signOut}
 
             >
 
@@ -1034,9 +1264,15 @@ if (!signedIn) {
 
                     "Turn an idea into an actionable plan.",
 
+                  "Task Board": "Move tasks through your work stages.",
+
                   Workflows:
 
-                    "Track tasks from start to finish.",
+                    "Create and manage saved workflows.",
+
+                  Reminders: "Keep track of scheduled follow-ups.",
+
+                  Approvals: "Review pending assistant actions.",
 
                   Settings:
 
@@ -1075,6 +1311,8 @@ if (!signedIn) {
 
 
           {taskError && <p className="auth-error" role="alert">{taskError}</p>}
+
+          {resourceError && <p className="auth-error" role="alert">{resourceError}</p>}
 
           {page === "Dashboard" && (
 
@@ -1202,7 +1440,7 @@ if (!signedIn) {
 
                   label="Workflows"
 
-                  value={generated ? 1 : 0}
+                  value={workflows.length}
 
                   color="orange"
 
@@ -1295,6 +1533,13 @@ if (!signedIn) {
 
                 />
 
+                <input
+                  value={newDescription}
+                  onChange={(event) => setNewDescription(event.target.value)}
+                  placeholder="Description (optional)"
+                  aria-label="New task description"
+                />
+
 
 
                 <button className="primary-btn" type="submit">
@@ -1331,21 +1576,19 @@ if (!signedIn) {
 
 
 
-                <h2>What do you want to accomplish?</h2>
+                <h2>Workspace assistant</h2>
 
                 <p>
 
-                  Describe a goal and create a simple task plan
-
-                  for your workspace.
+                  Run a supported command for tasks, reminders, workflows, or approvals.
 
                 </p>
 
 
 
-                <form onSubmit={makeWorkflow}>
+                <form onSubmit={sendAssistantMessage}>
 
-                  <label htmlFor="goal">YOUR GOAL</label>
+                    <label htmlFor="goal">COMMAND</label>
 
 
 
@@ -1357,13 +1600,12 @@ if (!signedIn) {
 
                     value={prompt}
 
-                    onChange={(event) =>
+                    onChange={(event) => {
+                      setPrompt(event.target.value);
+                      setAssistantReply(null);
+                    }}
 
-                      setPrompt(event.target.value)
-
-                    }
-
-                    placeholder="Example: Prepare our hackathon demo by tomorrow\..."
+                    placeholder="Examples: create task: Prepare demo · show my reminders"
 
                     required
 
@@ -1381,7 +1623,7 @@ if (!signedIn) {
 
                     <Sparkles size={17} />
 
-                    Generate task plan
+                    Run command
 
                   </button>
 
@@ -1389,9 +1631,7 @@ if (!signedIn) {
 
                 <p className="hint">
 
-                  Demo version: creates a basic task plan.
-
-                  A real AI service is not connected yet.
+                  Try “create task: Prepare demo”, “show my tasks”, “create reminder: Review demo at 2026-10-12T11:00+05:30”, or “send email”.
 
                 </p>
 
@@ -1405,9 +1645,9 @@ if (!signedIn) {
 
                   <div>
 
-                    <h3>Workflow preview</h3>
+                    <h3>Assistant response</h3>
 
-                    <p>Your generated tasks appear here.</p>
+                    <p>Your assistant response appears here.</p>
 
                   </div>
 
@@ -1415,15 +1655,15 @@ if (!signedIn) {
 
 
 
-                {generated ? (
+                {assistantReply ? (
 
                   <div className="success-message">
 
                     <CheckCircle2 size={20} />
 
-                    Tasks added to your workspace!
+                    {assistantReply.message}
 
-                    <button
+                    {assistantReply.data?.id && <button
 
                       className="link-btn"
 
@@ -1433,7 +1673,7 @@ if (!signedIn) {
 
                       View tasks →
 
-                    </button>
+                    </button>}
 
                   </div>
 
@@ -1447,7 +1687,7 @@ if (!signedIn) {
 
                     <p>
 
-                      Enter a goal to create a simple task plan.
+                      Enter a request to create a task in your workspace.
 
                     </p>
 
@@ -1463,11 +1703,11 @@ if (!signedIn) {
 
 
 
-          {page === "Workflows" && (
+          {page === "Task Board" && (
 
             <section className="kanban">
 
-              {["To Do", "In Progress", "Done"].map((status) => (
+              {["To Do", "In Progress", "Done", "Cancelled"].map((status) => (
 
                 <div className="kanban-column" key={status}>
 
@@ -1535,6 +1775,8 @@ if (!signedIn) {
 
                           <option>Done</option>
 
+                          <option>Cancelled</option>
+
                         </select>
 
                       </div>
@@ -1550,6 +1792,156 @@ if (!signedIn) {
           )}
 
 
+
+          {page === "Workflows" && (
+            <section className="panel">
+              <div className="panel-header">
+                <div>
+                  <h3>Saved workflows</h3>
+                  <p>Workflows are stored with your account.</p>
+                </div>
+              </div>
+
+              <form className="add-form" onSubmit={createWorkflow}>
+                <input
+                  value={workflowName}
+                  onChange={(event) => setWorkflowName(event.target.value)}
+                  placeholder="Workflow name"
+                  aria-label="Workflow name"
+                  required
+                />
+                <input
+                  value={workflowDescription}
+                  onChange={(event) => setWorkflowDescription(event.target.value)}
+                  placeholder="Description (optional)"
+                  aria-label="Workflow description"
+                />
+                <button className="primary-btn" type="submit">
+                  <Plus size={16} /> Create workflow
+                </button>
+              </form>
+
+              {!workflows.length ? (
+                <div className="empty"><Workflow size={30} /><h3>No workflows yet</h3><p>Create a workflow to track a repeatable process.</p></div>
+              ) : (
+                <div className="task-list">
+                  {workflows.map((workflow) => (
+                    <div className="task-row" key={workflow.id}>
+                      <div className="task-title">
+                        <strong>{workflow.name}</strong>
+                        <small>{workflow.description || "No description"}</small>
+                      </div>
+                      <select
+                        aria-label={`Status for ${workflow.name}`}
+                        value={workflow.status}
+                        onChange={(event) => updateWorkflow(workflow.id, { status: event.target.value })}
+                      >
+                        <option value="draft">Draft</option>
+                        <option value="active">Active</option>
+                        <option value="paused">Paused</option>
+                        <option value="completed">Completed</option>
+                      </select>
+                      <button className="delete-btn" aria-label={`Delete ${workflow.name}`} onClick={() => deleteWorkflow(workflow.id)}>
+                        <Trash2 size={15} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+          )}
+
+          {page === "Reminders" && (
+            <section className="panel">
+              <div className="panel-header">
+                <div><h3>Scheduled reminders</h3><p>Reminders are saved to your account with their timezone.</p></div>
+              </div>
+              <form className="add-form" onSubmit={createReminder}>
+                <input
+                  value={reminderTitle}
+                  onChange={(event) => setReminderTitle(event.target.value)}
+                  placeholder="What should we remind you about?"
+                  aria-label="Reminder title"
+                  required
+                />
+                <input
+                  type="datetime-local"
+                  value={reminderAt}
+                  onChange={(event) => setReminderAt(event.target.value)}
+                  aria-label="Reminder date and time"
+                  required
+                />
+                <button className="primary-btn" type="submit"><CalendarClock size={16} /> Add reminder</button>
+              </form>
+              {!reminders.length ? (
+                <div className="empty"><Bell size={30} /><h3>No reminders yet</h3><p>Add a date and time for your next follow-up.</p></div>
+              ) : (
+                <div className="task-list">
+                  {reminders.map((reminder) => (
+                    <div className="task-row" key={reminder.id}>
+                      <div className="task-title">
+                        <strong>{reminderDrafts[reminder.id] ?? reminder.title}</strong>
+                        <small>{new Date(reminder.remind_at).toLocaleString()}</small>
+                      </div>
+                      <form className="add-form" onSubmit={(event) => {
+                        event.preventDefault();
+                        updateReminder(reminder.id, {
+                          title: reminderDrafts[reminder.id] ?? reminder.title,
+                        });
+                      }}>
+                        <input
+                          value={reminderDrafts[reminder.id] ?? reminder.title}
+                          onChange={(event) => setReminderDrafts((old) => ({
+                            ...old,
+                            [reminder.id]: event.target.value,
+                          }))}
+                          aria-label={`Edit ${reminder.title}`}
+                        />
+                        <button className="secondary-btn" type="submit">Save</button>
+                      </form>
+                      <span className="task-status">{reminder.status}</span>
+                      <button className="delete-btn" aria-label={`Delete ${reminder.title}`} onClick={() => deleteReminder(reminder.id)}><Trash2 size={15} /></button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </section>
+          )}
+
+          {page === "Approvals" && (
+            <section className="panel">
+              <div className="panel-header">
+                <div><h3>Action approvals</h3><p>Review proposed email and calendar actions before they are approved.</p></div>
+              </div>
+              {!approvals.length ? (
+                <div className="empty"><ShieldCheck size={30} /><h3>No approvals to review</h3><p>Assistant proposals that need approval will appear here.</p></div>
+              ) : (
+                <div className="task-list">
+                  {approvals.map((approval) => (
+                    <div className="task-row" key={approval.id}>
+                      <div className="task-title">
+                        <strong>{approval.action_type.replaceAll("_", " ")}</strong>
+                        <small>{new Date(approval.created_at).toLocaleString()}</small>
+                      </div>
+                      <span className="task-status">{approval.status}</span>
+                      <button className="secondary-btn" onClick={() => loadApprovalPreview(approval.id)}>Review details</button>
+                      {approval.status === "pending" && <>
+                        <button className="secondary-btn" onClick={() => decideApproval(approval.id, "approved")}>Approve</button>
+                        <button className="secondary-btn" onClick={() => decideApproval(approval.id, "rejected")}>Reject</button>
+                      </>}
+                    </div>
+                  ))}
+                </div>
+              )}
+              {approvalPreview && (
+                <div className="panel approval-preview">
+                  <div className="panel-header"><div><h3>Approval #{approvalPreview.id}</h3><p>{approvalPreview.action_type.replaceAll("_", " ")} · {approvalPreview.status}</p></div></div>
+                  <pre>{JSON.stringify(approvalPreview.payload, null, 2)}</pre>
+                </div>
+              )}
+              <p className="hint">Approving records your decision. Sending email and calendar execution require a configured external integration.</p>
+            </section>
+          )}
 
           {page === "Settings" && (
 
@@ -1605,11 +1997,11 @@ if (!signedIn) {
 
                   <strong>Application</strong>
 
-                  <p>C2Flow AI · Hackathon MVP</p>
+                  <p>C2Flow AI · Connected workspace</p>
 
                 </div>
 
-                <span className="ai-label">DEMO</span>
+                  <span className="ai-label">API</span>
 
               </div>
 
@@ -1623,7 +2015,7 @@ if (!signedIn) {
 
                   <p>
 
-                    Tasks are currently held in application state.
+                    Tasks, workflows, reminders, and approvals are stored in the backend.
 
                   </p>
 
@@ -1649,15 +2041,7 @@ if (!signedIn) {
 
                   className="secondary-btn"
 
-                  onClick={() => {
-
-                    setSignedIn(false);
-
-                    setPassword("");
-
-                    setPage("Dashboard");
-
-                  }}
+                  onClick={signOut}
 
                 >
 
@@ -1779,21 +2163,22 @@ function TaskList({ tasks, updateTask, deleteTask }) {
 
             </strong>
 
-            <small>C2Flow AI workspace</small>
+            <small>{task.description || "C2Flow AI workspace"}</small>
 
           </div>
 
 
 
-          <span
-
+          <select
             className={`priority ${task.priority.toLowerCase()}`}
-
+            aria-label={`Priority for ${task.title}`}
+            value={task.priority}
+            onChange={(event) => updateTask(task.id, { priority: event.target.value })}
           >
-
-            {task.priority}
-
-          </span>
+            <option>Low</option>
+            <option>Medium</option>
+            <option>High</option>
+          </select>
 
 
 
