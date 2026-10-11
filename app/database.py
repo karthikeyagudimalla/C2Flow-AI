@@ -43,6 +43,40 @@ def ensure_task_columns():
                 text("ALTER TABLE tasks ADD COLUMN due_at TIMESTAMP WITH TIME ZONE")
             )
 
+
+def ensure_reminder_calendar_columns():
+    """Add Google Calendar sync fields to existing reminder tables."""
+    columns = {column["name"] for column in inspect(engine).get_columns("reminders")}
+    with engine.begin() as connection:
+        if "google_event_id" not in columns:
+            connection.execute(
+                text("ALTER TABLE reminders ADD COLUMN google_event_id VARCHAR(255)")
+            )
+        if "calendar_sync_status" not in columns:
+            connection.execute(
+                text(
+                    "ALTER TABLE reminders ADD COLUMN calendar_sync_status "
+                    "VARCHAR(20) NOT NULL DEFAULT 'not_connected'"
+                )
+            )
+
+
+def ensure_google_auth_columns():
+    """Allow Google-only accounts and add their stable Google subject ID."""
+    columns = {column["name"] for column in inspect(engine).get_columns("users")}
+    with engine.begin() as connection:
+        if "google_sub" not in columns:
+            connection.execute(text("ALTER TABLE users ADD COLUMN google_sub VARCHAR(255)"))
+        connection.execute(
+            text("ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL")
+        )
+        connection.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_google_sub "
+                "ON users (google_sub)"
+            )
+        )
+
 SessionLocal = sessionmaker(
     bind=engine,
     autoflush=False,

@@ -21,6 +21,10 @@ class LoginResponse(BaseModel):
     expires_in: int = 1800
 
 
+class GoogleLoginExchangeRequest(BaseModel):
+    code: str = Field(min_length=20, max_length=128)
+
+
 class TaskCreate(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     description: str | None = Field(default=None, max_length=5000)
@@ -64,6 +68,7 @@ class ReminderResponse(BaseModel):
     title: str
     remind_at: datetime
     status: str
+    calendar_sync_status: Literal["not_connected", "synced", "failed"] = "not_connected"
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

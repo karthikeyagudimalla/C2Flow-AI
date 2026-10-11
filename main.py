@@ -1,19 +1,40 @@
 import logging
-from datetime import datetime, timezone
+import hashlib
+import secrets
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.responses import RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.database import Base, engine, ensure_task_columns
+from app.database import (
+    Base,
+    engine,
+    ensure_google_auth_columns,
+    ensure_reminder_calendar_columns,
+    ensure_task_columns,
+)
 from app.ai_planner import generate_gemini_plan
+from app.google_calendar import (
+    begin_google_oauth,
+    calendar_is_configured,
+    delete_google_calendar_event,
+    finish_google_oauth,
+    sync_reminder_to_google_calendar,
+)
+from app.google_auth import (
+    begin_google_login,
+    complete_google_login,
+    google_login_is_configured,
+)
 from app.dependencies import get_db
-from app.models import User
+from app.models import GoogleCalendarConnection, GoogleLoginHandoff, User
 from app.schemas import (
     ApprovalCreate,
     ApprovalDecision,
@@ -25,6 +46,7 @@ from app.schemas import (
     AIPlanGenerateRequest,
     AIPlanResponse,
     AIPlanTask,
+    GoogleLoginExchangeRequest,
     LoginResponse,
     ReminderCreate,
     ReminderResponse,
@@ -58,6 +80,8 @@ from contextlib import asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     ensure_task_columns()
+    ensure_reminder_calendar_columns()
+    ensure_google_auth_columns()
     yield
 
 
@@ -158,7 +182,11 @@ def login(
     email = form.username.lower()
     user = db.scalar(select(User).where(User.email == email))
 
-    if user is None or not verify_password(form.password, user.password_hash):
+    if (
+        user is None
+        or user.password_hash is None
+        or not verify_password(form.password, user.password_hash)
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password.",
@@ -169,6 +197,112 @@ def login(
         access_token=create_access_token(user.id),
         expires_in=1800,
     )
+
+
+@app.post("/api/auth/google")
+def start_google_login():
+    if not google_login_is_configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Configure GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET first.",
+        )
+    try:
+        return {"authorization_url": begin_google_login()}
+    except Exception as error:
+        logger.exception("Could not start Google sign-in.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google sign-in is not available right now.",
+        ) from error
+
+
+@app.get("/api/auth/google/callback")
+def google_login_callback(
+    request: Request,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    db: Session = Depends(get_db),
+):
+    outcome = "failed"
+    if error == "access_denied":
+        outcome = "cancelled"
+    elif not error and code and state:
+        try:
+            user = complete_google_login(
+                callback_url=str(request.url),
+                state=state,
+                db=db,
+            )
+            now = datetime.now(timezone.utc)
+            db.execute(
+                delete(GoogleLoginHandoff).where(
+                    GoogleLoginHandoff.expires_at <= now
+                )
+            )
+            handoff_code = secrets.token_urlsafe(32)
+            db.add(
+                GoogleLoginHandoff(
+                    user_id=user.id,
+                    code_hash=hashlib.sha256(
+                        handoff_code.encode("utf-8")
+                    ).hexdigest(),
+                    expires_at=now + timedelta(minutes=2),
+                )
+            )
+            db.commit()
+            outcome = handoff_code
+        except Exception as callback_error:
+            db.rollback()
+            logger.warning(
+                "Google sign-in callback failed (%s).",
+                type(callback_error).__name__,
+            )
+
+    if outcome in {"failed", "cancelled"}:
+        return RedirectResponse(
+            url=f"{settings.FRONTEND_URL.rstrip('/')}?google_auth={outcome}",
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    return RedirectResponse(
+        url=(
+            f"{settings.FRONTEND_URL.rstrip('/')}#google_auth_code="
+            f"{outcome}"
+        ),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@app.post("/api/auth/google/exchange", response_model=LoginResponse)
+def exchange_google_login_code(
+    payload: GoogleLoginExchangeRequest,
+    db: Session = Depends(get_db),
+):
+    code_hash = hashlib.sha256(payload.code.encode("utf-8")).hexdigest()
+    now = datetime.now(timezone.utc)
+    handoff = db.scalar(
+        select(GoogleLoginHandoff)
+        .where(
+            GoogleLoginHandoff.code_hash == code_hash,
+            GoogleLoginHandoff.expires_at > now,
+        )
+        .with_for_update()
+    )
+    if handoff is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Google sign-in code expired or already used. Please try again.",
+        )
+
+    user_id = handoff.user_id
+    db.delete(handoff)
+    db.commit()
+    if db.get(User, user_id) is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Google account is no longer available.",
+        )
+    return LoginResponse(access_token=create_access_token(user_id))
 
 
 @app.get("/api/auth/me", response_model=UserResponse)
@@ -190,6 +324,91 @@ def current_user(
         raise HTTPException(status_code=401, detail="Invalid or expired token.")
 
     return user
+
+
+@app.get("/api/integrations/google-calendar/status")
+def google_calendar_status(
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    connection = db.scalar(
+        select(GoogleCalendarConnection).where(
+            GoogleCalendarConnection.owner_id == user.id
+        )
+    )
+    return {
+        "configured": calendar_is_configured(),
+        "connected": connection is not None,
+    }
+
+
+@app.post("/api/integrations/google-calendar/connect")
+def connect_google_calendar(user: User = Depends(current_user)):
+    if not calendar_is_configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "Configure GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and "
+                "GOOGLE_TOKEN_ENCRYPTION_KEY in the backend environment first."
+            ),
+        )
+    try:
+        return {"authorization_url": begin_google_oauth(user.id)}
+    except Exception as error:
+        logger.exception("Could not start Google Calendar authorization.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Google Calendar could not be configured.",
+        ) from error
+
+
+@app.delete("/api/integrations/google-calendar")
+def disconnect_google_calendar(
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    connection = db.scalar(
+        select(GoogleCalendarConnection).where(
+            GoogleCalendarConnection.owner_id == user.id
+        )
+    )
+    if connection is not None:
+        db.delete(connection)
+        db.commit()
+    return {"connected": False}
+
+
+@app.get("/api/integrations/google-calendar/callback")
+def google_calendar_callback(
+    request: Request,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    db: Session = Depends(get_db),
+):
+    result = "error"
+    if not error and code and state:
+        try:
+            user_id = finish_google_oauth(
+                callback_url=str(request.url),
+                state=state,
+                db=db,
+            )
+            if db.get(User, user_id) is not None:
+                result = "connected"
+            else:
+                logger.warning("Google Calendar OAuth returned for a missing user.")
+        except Exception:
+            logger.exception("Google Calendar authorization callback failed.")
+    elif error == "access_denied":
+        result = "cancelled"
+
+    return RedirectResponse(
+        url=f"{settings.FRONTEND_URL.rstrip('/')}?google_calendar={result}",
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
 @app.get("/api/tasks", response_model=list[TaskResponse])
 def list_tasks(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
@@ -448,6 +667,8 @@ def create_reminder(
     db.add(reminder)
     db.commit()
     db.refresh(reminder)
+    sync_reminder_to_google_calendar(db, reminder)
+    db.refresh(reminder)
 
     return reminder
 
@@ -552,7 +773,33 @@ def update_reminder(
 
     db.commit()
     db.refresh(reminder)
+    sync_reminder_to_google_calendar(db, reminder)
+    db.refresh(reminder)
 
+    return reminder
+
+
+@app.post("/api/reminders/{reminder_id}/sync", response_model=ReminderResponse)
+def sync_reminder(
+    reminder_id: int,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+):
+    from app.models import Reminder
+
+    reminder = db.scalar(
+        select(Reminder).where(
+            Reminder.id == reminder_id,
+            Reminder.owner_id == user.id,
+        )
+    )
+    if reminder is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Reminder not found.",
+        )
+    sync_reminder_to_google_calendar(db, reminder)
+    db.refresh(reminder)
     return reminder
 
 
@@ -595,6 +842,7 @@ def delete_reminder(
             detail="Reminder not found.",
         )
 
+    delete_google_calendar_event(db, user_id, reminder.google_event_id)
     db.delete(reminder)
     db.commit()
 
@@ -1288,6 +1536,8 @@ def assistant(
         db.add(reminder)
         db.commit()
         db.refresh(reminder)
+        sync_reminder_to_google_calendar(db, reminder)
+        db.refresh(reminder)
 
         return {
             **result,
@@ -1298,6 +1548,7 @@ def assistant(
                 "title": reminder.title,
                 "remind_at": reminder.remind_at,
                 "status": reminder.status,
+                "calendar_sync_status": reminder.calendar_sync_status,
             },
         }
 

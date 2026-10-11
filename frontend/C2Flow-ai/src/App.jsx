@@ -132,6 +132,11 @@ export default function App() {
 
   const [reminders, setReminders] = useState([]);
 
+  const [googleCalendar, setGoogleCalendar] = useState({
+    configured: false,
+    connected: false,
+  });
+
   const [workflows, setWorkflows] = useState([]);
 
   const [approvals, setApprovals] = useState([]);
@@ -164,13 +169,14 @@ export default function App() {
 
 
   async function loadWorkspace(accessToken) {
-    const [user, backendTasks, backendReminders, backendWorkflows, backendApprovals] =
+    const [user, backendTasks, backendReminders, backendWorkflows, backendApprovals, calendarStatus] =
       await Promise.all([
         apiRequest("/api/auth/me", { token: accessToken }),
         apiRequest("/api/tasks", { token: accessToken }),
         apiRequest("/api/reminders", { token: accessToken }),
         apiRequest("/api/workflows", { token: accessToken }),
         apiRequest("/api/approvals", { token: accessToken }),
+        apiRequest("/api/integrations/google-calendar/status", { token: accessToken }),
       ]);
 
     setEmail(user.email);
@@ -178,9 +184,60 @@ export default function App() {
     setReminders(backendReminders);
     setWorkflows(backendWorkflows);
     setApprovals(backendApprovals);
+    setGoogleCalendar(calendarStatus);
+  }
+
+  async function startGoogleSignIn() {
+    setAuthError("");
+    setAuthLoading(true);
+    try {
+      const response = await apiRequest("/api/auth/google", {
+        method: "POST",
+      });
+      window.location.assign(response.authorization_url);
+    } catch (error) {
+      setAuthError(error.message || "Google sign-in is unavailable.");
+      setAuthLoading(false);
+    }
   }
 
   useEffect(() => {
+    const query = new URLSearchParams(window.location.search);
+    const fragment = new URLSearchParams(window.location.hash.slice(1));
+    const googleCode = fragment.get("google_auth_code");
+    const googleResult = query.get("google_auth");
+    if (googleCode) {
+      window.history.replaceState({}, document.title, window.location.pathname);
+      // oxlint-disable-next-line react/set-state-in-effect
+      setAuthLoading(true);
+      apiRequest("/api/auth/google/exchange", {
+        method: "POST",
+        body: JSON.stringify({ code: googleCode }),
+      })
+        .then(async (result) => {
+          window.localStorage.setItem("c2flow_access_token", result.access_token);
+          await loadWorkspace(result.access_token);
+          setToken(result.access_token);
+          setSignedIn(true);
+          setPage("Dashboard");
+        })
+        .catch((error) => {
+          setAuthError(error.message || "Google sign-in could not be completed.");
+        })
+        .finally(() => setAuthLoading(false));
+      return;
+    }
+    if (googleResult) {
+      window.history.replaceState({}, document.title, window.location.pathname);
+      if (googleResult === "cancelled") {
+        // oxlint-disable-next-line react/set-state-in-effect
+        setAuthError("Google sign-in was cancelled.");
+      } else if (googleResult === "failed") {
+        // oxlint-disable-next-line react/set-state-in-effect
+        setAuthError("Google sign-in failed. Please try again.");
+      }
+    }
+
     const savedToken = window.localStorage.getItem("c2flow_access_token");
     if (!savedToken) return;
 
@@ -380,6 +437,47 @@ export default function App() {
       setReminders((old) => old.filter((item) => item.id !== reminderId));
     } catch (error) {
       setResourceError(error.message || "Could not delete this reminder.");
+    }
+  }
+
+  async function connectGoogleCalendar() {
+    setResourceError("");
+    try {
+      const response = await apiRequest(
+        "/api/integrations/google-calendar/connect",
+        { token, method: "POST" },
+      );
+      window.location.assign(response.authorization_url);
+    } catch (error) {
+      setResourceError(error.message || "Could not connect Google Calendar.");
+    }
+  }
+
+  async function disconnectGoogleCalendar() {
+    setResourceError("");
+    try {
+      await apiRequest("/api/integrations/google-calendar", {
+        token,
+        method: "DELETE",
+      });
+      setGoogleCalendar((current) => ({ ...current, connected: false }));
+    } catch (error) {
+      setResourceError(error.message || "Could not disconnect Google Calendar.");
+    }
+  }
+
+  async function retryCalendarSync(reminderId) {
+    setResourceError("");
+    try {
+      const updated = await apiRequest(`/api/reminders/${reminderId}/sync`, {
+        token,
+        method: "POST",
+      });
+      setReminders((old) => old.map((item) =>
+        item.id === reminderId ? updated : item
+      ));
+    } catch (error) {
+      setResourceError(error.message || "Could not sync this reminder.");
     }
   }
 
@@ -910,15 +1008,8 @@ if (!signedIn) {
 
               className="auth-social"
 
-              onClick={() =>
-
-                setAuthError(
-
-                  "Google sign-in requires Google OAuth setup."
-
-                )
-
-              }
+              onClick={startGoogleSignIn}
+              disabled={authLoading}
 
             >
 
@@ -1853,7 +1944,7 @@ if (!signedIn) {
           {page === "Reminders" && (
             <section className="panel">
               <div className="panel-header">
-                <div><h3>Scheduled reminders</h3><p>Reminders are saved to your account with their timezone.</p></div>
+                <div><h3>Scheduled reminders</h3><p>Reminders are saved to your account and synced to Google Calendar when connected.</p></div>
               </div>
               <form className="add-form" onSubmit={createReminder}>
                 <input
@@ -1880,7 +1971,14 @@ if (!signedIn) {
                     <div className="task-row" key={reminder.id}>
                       <div className="task-title">
                         <strong>{reminderDrafts[reminder.id] ?? reminder.title}</strong>
-                        <small>{new Date(reminder.remind_at).toLocaleString()}</small>
+                        <small>
+                          {new Date(reminder.remind_at).toLocaleString()}
+                          {reminder.calendar_sync_status === "synced"
+                            ? " · Added to Google Calendar"
+                            : googleCalendar.connected
+                              ? " · Calendar sync needs attention"
+                              : " · Connect Google Calendar in Settings to sync"}
+                        </small>
                       </div>
                       <form className="add-form" onSubmit={(event) => {
                         event.preventDefault();
@@ -1899,6 +1997,14 @@ if (!signedIn) {
                         <button className="secondary-btn" type="submit">Save</button>
                       </form>
                       <span className="task-status">{reminder.status}</span>
+                      {googleCalendar.connected && reminder.calendar_sync_status !== "synced" && (
+                        <button
+                          className="secondary-btn"
+                          onClick={() => retryCalendarSync(reminder.id)}
+                        >
+                          Retry calendar sync
+                        </button>
+                      )}
                       <button className="delete-btn" aria-label={`Delete ${reminder.title}`} onClick={() => deleteReminder(reminder.id)}><Trash2 size={15} /></button>
                     </div>
                   ))}
@@ -2020,6 +2126,35 @@ if (!signedIn) {
 
                 </div>
 
+              </div>
+
+              <div className="setting-row">
+                <div>
+                  <strong>Google Calendar</strong>
+                  <p>
+                    {googleCalendar.connected
+                      ? "Connected. New and edited reminders are added as calendar events with a 10 minute popup reminder."
+                      : googleCalendar.configured
+                        ? "Connect your Google account to add reminders directly to your primary calendar."
+                        : "Add Google OAuth credentials to the backend .env before connecting a calendar."}
+                  </p>
+                </div>
+                {googleCalendar.connected ? (
+                  <button
+                    className="secondary-btn"
+                    onClick={disconnectGoogleCalendar}
+                  >
+                    Disconnect Google Calendar
+                  </button>
+                ) : (
+                  <button
+                    className="secondary-btn"
+                    onClick={connectGoogleCalendar}
+                    disabled={!googleCalendar.configured}
+                  >
+                    Connect Google Calendar
+                  </button>
+                )}
               </div>
 
 
