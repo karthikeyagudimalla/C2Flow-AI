@@ -1,0 +1,50 @@
+databases:
+  - name: tricity-db
+    databaseName: tricity
+    user: tricity_user
+    plan: basic-256mb
+    region: singapore
+
+services:
+  - type: web
+    name: tricity-api
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: APP_NAME
+        value: Tricity API
+      - key: ENVIRONMENT
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: tricity-db
+          property: connectionString
+      - key: JWT_SECRET
+        generateValue: true
+      - key: FRONTEND_URL
+        fromService:
+          type: web
+          name: tricity-frontend
+          envVarKey: RENDER_EXTERNAL_URL
+      - key: CORS_ORIGINS
+        fromService:
+          type: web
+          name: tricity-frontend
+          envVarKey: RENDER_EXTERNAL_URL
+
+  - type: web
+    name: tricity-frontend
+    runtime: static
+    rootDir: frontend/C2Flow-ai
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_BASE_URL
+        fromService:
+          type: web
+          name: tricity-api
+          envVarKey: RENDER_EXTERNAL_URL
