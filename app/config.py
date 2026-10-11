@@ -14,6 +14,8 @@ class Settings:
         "CORS_ORIGINS",
         "http://localhost:3000,http://localhost:5173",
     )
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+    GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 
 settings = Settings()

@@ -68,6 +68,15 @@ function taskFromApi(task) {
   };
 }
 
+function toDateTimeInput(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60000)
+    .toISOString()
+    .slice(0, 16);
+}
+
 
 
 const navigation = [
@@ -139,7 +148,11 @@ export default function App() {
 
   const [workflowDescription, setWorkflowDescription] = useState("");
 
-  const [assistantReply, setAssistantReply] = useState(null);
+  const [planDraft, setPlanDraft] = useState(null);
+
+  const [planLoading, setPlanLoading] = useState(false);
+
+  const [planSaving, setPlanSaving] = useState(false);
 
   const [approvalPreview, setApprovalPreview] = useState(null);
 
@@ -260,40 +273,62 @@ export default function App() {
 
 
 
-  async function sendAssistantMessage(event) {
+  async function generatePlan(event) {
     event.preventDefault();
     if (!prompt.trim()) return;
 
     const goal = prompt.trim();
     setResourceError("");
+    setPlanLoading(true);
+    setPlanDraft(null);
     try {
-      const reply = await apiRequest("/api/assistant", {
+      const draft = await apiRequest("/api/ai/plan", {
         token,
         method: "POST",
-        body: JSON.stringify({ message: goal }),
+        body: JSON.stringify({
+          goal,
+          timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+        }),
       });
-      setAssistantReply(reply);
-
-      if (["list_tasks", "list_pending_tasks"].includes(reply.intent)) {
-        setTasks(reply.data.map(taskFromApi));
-      } else if (reply.intent === "list_reminders") {
-        setReminders(reply.data);
-      } else if (reply.intent === "list_workflows") {
-        setWorkflows(reply.data);
-      } else if (reply.intent === "create_task" && reply.data?.id) {
-        setTasks((old) => [taskFromApi(reply.data), ...old]);
-      } else if (reply.intent === "create_reminder" && reply.data?.id) {
-        setReminders((old) => [...old, reply.data]);
-      } else if (reply.intent === "complete_task" && reply.data?.id) {
-        setTasks((old) => old.map((task) =>
-          task.id === reply.data.id ? taskFromApi({ ...task, ...reply.data }) : task
-        ));
-      } else if (reply.requires_approval) {
-        const currentApprovals = await apiRequest("/api/approvals", { token });
-        setApprovals(currentApprovals);
-      }
+      setPlanDraft(draft);
     } catch (error) {
-      setResourceError(error.message || "The assistant request failed.");
+      setResourceError(error.message || "Could not generate a plan.");
+    } finally {
+      setPlanLoading(false);
+    }
+  }
+
+  function updatePlanTask(index, field, value) {
+    setPlanDraft((draft) => ({
+      ...draft,
+      tasks: draft.tasks.map((task, taskIndex) =>
+        taskIndex === index ? { ...task, [field]: value } : task
+      ),
+    }));
+  }
+
+  async function savePlan() {
+    if (!planDraft) return;
+    setResourceError("");
+    setPlanSaving(true);
+    try {
+      const savedTasks = await apiRequest("/api/ai/plan/confirm", {
+        token,
+        method: "POST",
+        body: JSON.stringify({
+          goal: planDraft.goal,
+          timezone: planDraft.timezone,
+          tasks: planDraft.tasks,
+        }),
+      });
+      setTasks((old) => [...savedTasks.map(taskFromApi), ...old]);
+      setPlanDraft(null);
+      setPrompt("");
+      setPage("Task Manager");
+    } catch (error) {
+      setResourceError(error.message || "Could not save the proposed tasks.");
+    } finally {
+      setPlanSaving(false);
     }
   }
 
@@ -1563,140 +1598,102 @@ if (!signedIn) {
 
 
           {page === "AI Flow" && (
-
             <section className="ai-layout">
-
               <div className="panel ai-panel">
-
-                <div className="ai-icon">
-
-                  <Sparkles size={25} />
-
-                </div>
-
-
-
-                <h2>Workspace assistant</h2>
-
-                <p>
-
-                  Run a supported command for tasks, reminders, workflows, or approvals.
-
-                </p>
-
-
-
-                <form onSubmit={sendAssistantMessage}>
-
-                    <label htmlFor="goal">COMMAND</label>
-
-
-
+                <div className="ai-icon"><Sparkles size={25} /></div>
+                <h2>What do you want to accomplish?</h2>
+                <p>Describe a goal and Gemini will turn it into a task plan with priorities and deadlines.</p>
+                <form onSubmit={generatePlan}>
+                  <label htmlFor="goal">YOUR GOAL</label>
                   <textarea
-
                     id="goal"
-
                     rows={5}
-
+                    maxLength={2000}
                     value={prompt}
-
-                    onChange={(event) => {
-                      setPrompt(event.target.value);
-                      setAssistantReply(null);
-                    }}
-
-                    placeholder="Examples: create task: Prepare demo · show my reminders"
-
+                    onChange={(event) => setPrompt(event.target.value)}
+                    placeholder="Prepare our hackathon demo by tomorrow afternoon."
                     required
-
                   />
-
-
-
-                  <button
-
-                    className="primary-btn generate-btn"
-
-                    type="submit"
-
-                  >
-
+                  <button className="primary-btn generate-btn" type="submit" disabled={planLoading}>
                     <Sparkles size={17} />
-
-                    Run command
-
+                    {planLoading ? "Planning..." : "Generate plan"}
                   </button>
-
                 </form>
-
-                <p className="hint">
-
-                  Try “create task: Prepare demo”, “show my tasks”, “create reminder: Review demo at 2026-10-12T11:00+05:30”, or “send email”.
-
-                </p>
-
+                <p className="hint">Only your goal and timezone are sent to Gemini. Generated tasks are not saved until you confirm them.</p>
               </div>
 
-
-
-              <div className="panel">
-
+              <div className="panel plan-preview">
                 <div className="panel-header">
-
-                  <div>
-
-                    <h3>Assistant response</h3>
-
-                    <p>Your assistant response appears here.</p>
-
-                  </div>
-
+                  <div><h3>Review your plan</h3><p>Edit task details before saving them to your workspace.</p></div>
                 </div>
-
-
-
-                {assistantReply ? (
-
-                  <div className="success-message">
-
-                    <CheckCircle2 size={20} />
-
-                    {assistantReply.message}
-
-                    {assistantReply.data?.id && <button
-
-                      className="link-btn"
-
-                      onClick={() => setPage("Task Manager")}
-
-                    >
-
-                      View tasks →
-
-                    </button>}
-
-                  </div>
-
+                {planDraft ? (
+                  <>
+                    <div className={`plan-provider ${planDraft.provider}`}>
+                      {planDraft.provider === "gemini" ? "Gemini plan" : "Deterministic fallback"}
+                    </div>
+                    <p className="plan-message">{planDraft.message}</p>
+                    <ol className="plan-task-list">
+                      {planDraft.tasks.map((task, index) => (
+                        <li className="plan-task" key={index}>
+                          <strong>Task {index + 1}</strong>
+                          <label htmlFor={`plan-title-${index}`}>Title</label>
+                          <input
+                            id={`plan-title-${index}`}
+                            maxLength={200}
+                            value={task.title}
+                            onChange={(event) => updatePlanTask(index, "title", event.target.value)}
+                          />
+                          <label htmlFor={`plan-description-${index}`}>Description</label>
+                          <textarea
+                            id={`plan-description-${index}`}
+                            rows={2}
+                            maxLength={1000}
+                            value={task.description || ""}
+                            onChange={(event) => updatePlanTask(index, "description", event.target.value)}
+                          />
+                          <div className="plan-task-fields">
+                            <div>
+                              <label htmlFor={`plan-priority-${index}`}>Priority</label>
+                              <select
+                                id={`plan-priority-${index}`}
+                                value={task.priority}
+                                onChange={(event) => updatePlanTask(index, "priority", event.target.value)}
+                              >
+                                <option value="low">Low</option>
+                                <option value="medium">Medium</option>
+                                <option value="high">High</option>
+                              </select>
+                            </div>
+                            <div>
+                              <label htmlFor={`plan-deadline-${index}`}>Deadline</label>
+                              <input
+                                id={`plan-deadline-${index}`}
+                                type="datetime-local"
+                                value={toDateTimeInput(task.due_at)}
+                                onChange={(event) => updatePlanTask(
+                                  index,
+                                  "due_at",
+                                  event.target.value ? new Date(event.target.value).toISOString() : null,
+                                )}
+                              />
+                            </div>
+                          </div>
+                        </li>
+                      ))}
+                    </ol>
+                    <div className="plan-actions">
+                      <button className="primary-btn" onClick={savePlan} disabled={planSaving}>
+                        {planSaving ? "Saving tasks..." : "Confirm and save tasks"}
+                      </button>
+                      <button className="secondary-btn" onClick={() => setPlanDraft(null)} disabled={planSaving}>
+                        Discard plan
+                      </button>
+                    </div>
+                  </>
                 ) : (
-
-                  <div className="empty">
-
-                    <Workflow size={38} />
-
-                    <h3>Your next idea starts here</h3>
-
-                    <p>
-
-                      Enter a request to create a task in your workspace.
-
-                    </p>
-
-                  </div>
-
+                  <div className="empty"><Workflow size={38} /><h3>Your plan will appear here</h3><p>Generate a plan to review its tasks, priorities, and dates.</p></div>
                 )}
-
               </div>
-
             </section>
 
           )}
@@ -1754,6 +1751,8 @@ if (!signedIn) {
 
 
                         <h4>{task.title}</h4>
+
+                        {task.due_at && <p className="task-deadline">Due {new Date(task.due_at).toLocaleString()}</p>}
 
 
 
@@ -2163,7 +2162,10 @@ function TaskList({ tasks, updateTask, deleteTask }) {
 
             </strong>
 
-            <small>{task.description || "C2Flow AI workspace"}</small>
+            <small>
+              {task.description || "C2Flow AI workspace"}
+              {task.due_at && ` · Due ${new Date(task.due_at).toLocaleString()}`}
+            </small>
 
           </div>
 

@@ -1169,6 +1169,92 @@ button:disabled {
   font-size: 11px;
 }
 
+.plan-provider {
+  display: inline-flex;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.plan-provider.deterministic {
+  background: rgba(251, 191, 36, 0.12);
+  color: #fbbf24;
+}
+
+.plan-message {
+  margin: 13px 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.plan-task-list {
+  display: grid;
+  gap: 12px;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.plan-task {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--bg);
+}
+
+.plan-task > strong {
+  margin-bottom: 3px;
+  color: var(--accent);
+  font-size: 12px;
+}
+
+.plan-task label {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.plan-task input,
+.plan-task textarea,
+.plan-task select {
+  width: 100%;
+  min-width: 0;
+  padding: 10px 11px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.plan-task-fields {
+  display: grid;
+  grid-template-columns: minmax(90px, 0.7fr) minmax(0, 1.3fr);
+  gap: 10px;
+}
+
+.plan-task-fields > div {
+  display: grid;
+  gap: 7px;
+}
+
+.plan-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.plan-task-list + .plan-actions {
+  margin-top: 16px;
+}
+
 .empty {
   display: flex;
   flex-direction: column;
@@ -1270,6 +1356,13 @@ button:disabled {
   overflow-wrap: anywhere;
   font-size: 12px;
   line-height: 1.8;
+}
+
+.task-deadline {
+  margin: -5px 0 12px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.6;
 }
 
 .kanban-card select {

@@ -27,16 +27,20 @@ engine = create_engine(
 )
 
 
-def ensure_task_priority_column():
-    """Add the task priority field to databases created by earlier versions."""
+def ensure_task_columns():
+    """Add task fields introduced after the initial database schema."""
     columns = {column["name"] for column in inspect(engine).get_columns("tasks")}
-    if "priority" not in columns:
-        with engine.begin() as connection:
+    with engine.begin() as connection:
+        if "priority" not in columns:
             connection.execute(
                 text(
                     "ALTER TABLE tasks ADD COLUMN priority "
                     "VARCHAR(20) NOT NULL DEFAULT 'medium'"
                 )
+            )
+        if "due_at" not in columns:
+            connection.execute(
+                text("ALTER TABLE tasks ADD COLUMN due_at TIMESTAMP WITH TIME ZONE")
             )
 
 SessionLocal = sessionmaker(

@@ -1,3 +1,7 @@
+import logging
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
@@ -6,7 +10,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.database import Base, engine, ensure_task_priority_column
+from app.database import Base, engine, ensure_task_columns
+from app.ai_planner import generate_gemini_plan
 from app.dependencies import get_db
 from app.models import User
 from app.schemas import (
@@ -16,6 +21,10 @@ from app.schemas import (
     ApprovalPreview,
     ApprovalResponse,
     AssistantRequest,
+    AIPlanCommitRequest,
+    AIPlanGenerateRequest,
+    AIPlanResponse,
+    AIPlanTask,
     LoginResponse,
     ReminderCreate,
     ReminderResponse,
@@ -39,6 +48,7 @@ from app.assistant_engine import interpret_command
 
 
 bearer_scheme = HTTPBearer(auto_error=False)
+logger = logging.getLogger(__name__)
 
 
 from contextlib import asynccontextmanager
@@ -47,7 +57,7 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
-    ensure_task_priority_column()
+    ensure_task_columns()
     yield
 
 
@@ -78,6 +88,41 @@ def root():
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
+
+
+def _validate_future_datetime(value: datetime, field_name: str) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{field_name} must include a timezone.",
+        )
+    if value <= datetime.now(timezone.utc):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"{field_name} must be in the future.",
+        )
+    return value.astimezone(timezone.utc)
+
+
+def _parse_plan_deadline(
+    value: str | None,
+) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        deadline = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Task deadline must be a valid ISO 8601 date-time.",
+        )
+    if deadline.tzinfo is None or deadline.utcoffset() is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Task deadlines must include a timezone offset.",
+        )
+    _validate_future_datetime(deadline, "Task deadline")
+    return deadline.astimezone(timezone.utc)
 
 
 @app.post(
@@ -221,6 +266,11 @@ def create_task(
         title=payload.title.strip(),
         description=payload.description,
         priority=payload.priority,
+        due_at=(
+            _validate_future_datetime(payload.due_at, "Task deadline")
+            if payload.due_at is not None
+            else None
+        ),
     )
 
     if not task.title:
@@ -282,6 +332,12 @@ def update_task(
                 detail="Task title cannot be blank.",
             )
 
+    if changes.get("due_at") is not None:
+        changes["due_at"] = _validate_future_datetime(
+            changes["due_at"],
+            "Task deadline",
+        )
+
     for field, value in changes.items():
         setattr(task, field, value)
 
@@ -329,8 +385,6 @@ def delete_task(
 
     db.delete(task)
     db.commit()
-
-from datetime import datetime, timezone
 
 @app.post(
     "/api/reminders",
@@ -939,6 +993,133 @@ def preview_approval(
         status=approval.status,
         created_at=approval.created_at,
     )
+
+@app.post("/api/ai/plan", response_model=AIPlanResponse)
+def generate_ai_plan(
+    request: AIPlanGenerateRequest,
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+):
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    try:
+        token_payload = decode_access_token(credentials.credentials)
+        user_id = int(token_payload["sub"])
+    except (jwt.InvalidTokenError, KeyError, ValueError, TypeError):
+        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+    if db.get(User, user_id) is None:
+        raise HTTPException(status_code=401, detail="User not found.")
+
+    try:
+        user_timezone = ZoneInfo(request.timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A valid IANA timezone is required.",
+        )
+
+    current_time = datetime.now(user_timezone)
+    if settings.GEMINI_API_KEY:
+        try:
+            generated = generate_gemini_plan(
+                api_key=settings.GEMINI_API_KEY,
+                model=settings.GEMINI_MODEL,
+                goal=request.goal,
+                current_time=current_time,
+                timezone_name=request.timezone,
+            )
+            validated_tasks = []
+            for task in generated.tasks:
+                due_at = _parse_plan_deadline(task.due_at)
+                validated_tasks.append(
+                    task.model_copy(
+                        update={"due_at": due_at.isoformat() if due_at else None}
+                    )
+                )
+            return AIPlanResponse(
+                goal=request.goal,
+                timezone=request.timezone,
+                provider="gemini",
+                message="Gemini prepared a plan. Review it before saving tasks.",
+                tasks=validated_tasks,
+            )
+        except Exception as error:
+            logger.warning(
+                "Gemini plan generation failed for model %s (%s): %s; "
+                "using deterministic fallback.",
+                settings.GEMINI_MODEL,
+                type(error).__name__,
+                error,
+                exc_info=True,
+            )
+
+    fallback = interpret_command(f"create task: {request.goal}")
+    title = fallback.get("parameters", {}).get("title", request.goal).strip()[:200]
+    fallback_task = AIPlanTask(
+        title=title,
+        description="Review this goal and split it into smaller steps.",
+        priority="medium",
+        due_at=None,
+    )
+    return AIPlanResponse(
+        goal=request.goal,
+        timezone=request.timezone,
+        provider="deterministic",
+        message=(
+            "Gemini is unavailable. The deterministic command interpreter "
+            "created a simple draft without an inferred deadline. Review it "
+            "and add dates before saving if needed."
+        ),
+        tasks=[fallback_task],
+    )
+
+
+@app.post(
+    "/api/ai/plan/confirm",
+    response_model=list[TaskResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+def save_ai_plan(
+    request: AIPlanCommitRequest,
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+):
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    try:
+        token_payload = decode_access_token(credentials.credentials)
+        user_id = int(token_payload["sub"])
+    except (jwt.InvalidTokenError, KeyError, ValueError, TypeError):
+        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+    if db.get(User, user_id) is None:
+        raise HTTPException(status_code=401, detail="User not found.")
+
+    try:
+        ZoneInfo(request.timezone)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A valid IANA timezone is required.",
+        )
+
+    from app.models import Task
+
+    tasks = [
+        Task(
+            owner_id=user_id,
+            title=proposed.title,
+            description=proposed.description,
+            priority=proposed.priority,
+            due_at=_parse_plan_deadline(proposed.due_at),
+        )
+        for proposed in request.tasks
+    ]
+    db.add_all(tasks)
+    db.commit()
+    for task in tasks:
+        db.refresh(task)
+    return tasks
+
 
 @app.post("/api/assistant")
 def assistant(
